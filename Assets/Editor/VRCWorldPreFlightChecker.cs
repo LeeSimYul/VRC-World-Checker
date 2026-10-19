@@ -7,7 +7,8 @@
 //
 //  VRChat 월드 업로드 전에 열려 있는 모든 씬을 5개 카테고리로 진단하고,
 //  가능한 항목은 버튼 하나로 자동 수정(Auto-Fix)합니다.
-//  모든 수정은 Undo 그룹으로 기록되므로 Ctrl+Z로 되돌릴 수 있습니다.
+//  씬 수정은 Undo 그룹으로 기록되므로 Ctrl+Z로 되돌릴 수 있습니다.
+//  텍스처 임포트 설정(.meta) 축소는 Undo 대신 원본 값을 백업해 [원본 크기로 복원]으로 되돌립니다.
 // ============================================================================
 
 using System;
@@ -62,6 +63,8 @@ namespace VRCWorldPreFlight
             public string FixLabel;      // 자동 수정 버튼 라벨
             public string FixConfirm;    // 수정 전 확인 메시지 (null이면 확인 없이 수정)
             public Func<bool> FixAction; // 자동 수정 로직 (null이면 수동 처리 필요)
+            public string FixTooltip = DefaultFixTooltip;
+            public string AssetPath;     // 텍스처 항목의 에셋 경로 (원본 크기 복원 시 결과 갱신용)
             public bool IsFixed;
 
             // UnityEngine.Object의 == 연산자를 사용하므로 파괴된 오브젝트도 false로 판정됨
@@ -76,6 +79,18 @@ namespace VRCWorldPreFlight
                 FixConfirm = confirm;
             }
         }
+
+        /// <summary>애니메이션 클립이 오브젝트에 거는 바인딩 종류</summary>
+        [Flags]
+        private enum AnimatedKind
+        {
+            None = 0,
+            Transform = 1, // 위치/회전/스케일 → 하위 자식도 함께 움직임
+            Active = 2,    // GameObject m_IsActive 토글 → 하위 자식도 함께 꺼짐
+            Property = 4,  // 머티리얼·컴포넌트 프로퍼티 → 해당 오브젝트에만 영향
+        }
+
+        private const AnimatedKind InheritedAnimatedKinds = AnimatedKind.Transform | AnimatedKind.Active;
 
         /// <summary>텍스처 사용처 집계</summary>
         private sealed class TextureUsage
@@ -131,6 +146,9 @@ namespace VRCWorldPreFlight
 
         private const string MainTexProperty = "_MainTex";
         private const string PrefsPrefix = "VRCWorldPreFlight.";
+        private const string DefaultSizeBackupKey = PrefsPrefix + "TextureSizeBackup.Default";
+        private const string PlatformSizeBackupKey = PrefsPrefix + "TextureSizeBackup.Platform";
+        private const string DefaultFixTooltip = "자동 수정 (Fix) — Ctrl+Z로 되돌릴 수 있습니다.";
         private const string LogPrefix = "[VRC Pre-Flight] ";
         private const string ProgressTitle = "VRC World Pre-Flight Checker";
         private const int DisplayPageSize = 100;
@@ -172,12 +190,14 @@ namespace VRCWorldPreFlight
         private int _textureMaxSize = DefaultTextureMaxSize;
         private bool _skipEditorOnly = true;
 
-        // 텍스처 임포트 설정 Undo 추적: 에셋 경로 → 마지막으로 적용된 크기 설정 서명
-        private static readonly Dictionary<string, string> s_TrackedImporters = new Dictionary<string, string>();
-        private static bool s_ImporterRevertScheduled;
+        // 텍스처 Max Size 원본 백업 (에디터 세션 동안 유지)
+        // 임포트 설정은 .meta를 직접 바꾸므로 Undo 대신 이 백업으로 [원본 크기로 복원 (Restore)] 합니다.
+        private static readonly Dictionary<string, int> s_OriginalMaxTextureSizes = new Dictionary<string, int>();   // 에셋 경로 → 기존 maxTextureSize
+        private static readonly Dictionary<string, int> s_OriginalPlatformMaxSizes = new Dictionary<string, int>();  // "경로|플랫폼" → 기존 오버라이드 maxTextureSize
+        private static bool s_TextureBackupsLoaded;
 
         private static readonly Dictionary<Type, bool> s_MirrorTypeCache = new Dictionary<Type, bool>();
-        private static readonly HashSet<string> s_EmptyPaths = new HashSet<string>();
+        private static readonly Dictionary<string, AnimatedKind> s_NoAnimatedPaths = new Dictionary<string, AnimatedKind>();
         private static readonly List<Texture> s_NoTextures = new List<Texture>();
 
         // GUI 스타일 (EditorStyles는 OnGUI 안에서만 안전하므로 지연 생성)
@@ -589,7 +609,10 @@ namespace VRCWorldPreFlight
 
             using (new EditorGUI.DisabledScope(isPlaying || fixable == 0))
             {
-                var bulkContent = new GUIContent($"{k_BulkFixLabels[index]} ({fixable})", "이 카테고리에서 자동 수정 가능한 항목을 모두 수정합니다. (하나의 Undo 단계로 기록)");
+                string bulkTooltip = category == Category.MirrorTexture
+                    ? "이 카테고리에서 자동 수정 가능한 항목을 모두 수정합니다. (텍스처 축소는 Undo 대신 [원본 크기로 복원]으로 되돌림)"
+                    : "이 카테고리에서 자동 수정 가능한 항목을 모두 수정합니다. (하나의 Undo 단계로 기록)";
+                var bulkContent = new GUIContent($"{k_BulkFixLabels[index]} ({fixable})", bulkTooltip);
                 if (GUILayout.Button(bulkContent, GUILayout.Width(150f), GUILayout.Height(20f)))
                     Defer(() => BulkFix(category));
             }
@@ -598,6 +621,8 @@ namespace VRCWorldPreFlight
             if (_foldouts[index])
             {
                 GUILayout.Label(k_CategoryHelp[index], _helpStyle);
+                if (category == Category.MirrorTexture)
+                    DrawTextureBackups(isPlaying);
 
                 if (!_hasScanned)
                 {
@@ -629,6 +654,43 @@ namespace VRCWorldPreFlight
                     if (hidden > 0 && GUILayout.Button($"{hidden}개 항목 더 보기 (+{DisplayPageSize})"))
                         _displayLimits[index] += DisplayPageSize;
                 }
+            }
+
+            EditorGUILayout.EndVertical();
+        }
+
+        /// <summary>축소한 텍스처의 원본 Max Size 백업 목록 + [원본 크기로 복원 (Restore)] 버튼</summary>
+        private void DrawTextureBackups(bool isPlaying)
+        {
+            LoadTextureBackups();
+            if (s_OriginalMaxTextureSizes.Count == 0)
+                return;
+
+            EditorGUILayout.BeginVertical(EditorStyles.helpBox);
+
+            EditorGUILayout.BeginHorizontal();
+            GUILayout.Label($"축소한 텍스처 원본 백업 ({s_OriginalMaxTextureSizes.Count}개) — 에디터를 닫기 전까지 유지", EditorStyles.boldLabel);
+            GUILayout.FlexibleSpace();
+            using (new EditorGUI.DisabledScope(isPlaying))
+            {
+                if (GUILayout.Button("모두 복원", GUILayout.Width(80f)))
+                    Defer(RestoreAllTextures);
+            }
+            EditorGUILayout.EndHorizontal();
+
+            foreach (string path in s_OriginalMaxTextureSizes.Keys)
+            {
+                EditorGUILayout.BeginHorizontal();
+                GUILayout.Label(new GUIContent(System.IO.Path.GetFileName(path), path), _nameStyle, GUILayout.Width(170f));
+                GUILayout.Label($"원본: {DescribeTextureBackup(path)}", _wrapStyle, GUILayout.MinWidth(120f), GUILayout.ExpandWidth(true));
+                if (GUILayout.Button(new GUIContent("Select", "Project에서 선택하고 Ping 합니다."), GUILayout.Width(60f)))
+                    SelectAndPing(AssetDatabase.LoadMainAssetAtPath(path));
+                using (new EditorGUI.DisabledScope(isPlaying))
+                {
+                    if (GUILayout.Button("원본 크기로 복원 (Restore)", GUILayout.Width(170f)))
+                        Defer(() => RestoreTexture(path));
+                }
+                EditorGUILayout.EndHorizontal();
             }
 
             EditorGUILayout.EndVertical();
@@ -672,7 +734,7 @@ namespace VRCWorldPreFlight
             {
                 using (new EditorGUI.DisabledScope(!alive || isPlaying))
                 {
-                    var fixContent = new GUIContent(issue.FixLabel, "자동 수정 (Fix) — Ctrl+Z로 되돌릴 수 있습니다.");
+                    var fixContent = new GUIContent(issue.FixLabel, issue.FixTooltip);
                     if (GUILayout.Button(fixContent, GUILayout.Width(96f)))
                         Defer(() => ApplySingleFix(issue));
                 }
@@ -699,12 +761,18 @@ namespace VRCWorldPreFlight
         private void DrawFooter(bool isPlaying)
         {
             EditorGUILayout.BeginHorizontal(EditorStyles.helpBox);
-            GUILayout.Label("모든 자동 수정은 Undo(Ctrl+Z)로 되돌릴 수 있습니다. 수정 후에는 씬을 저장하세요.", EditorStyles.miniLabel);
-            GUILayout.FlexibleSpace();
+            GUILayout.Label("텍스처 축소를 제외한 자동 수정은 Undo(Ctrl+Z)로 되돌릴 수 있습니다. (텍스처는 [원본 크기로 복원]) 수정 후에는 저장하세요.",
+                EditorStyles.wordWrappedMiniLabel);
             using (new EditorGUI.DisabledScope(isPlaying || !AnyOpenSceneDirty()))
             {
-                if (GUILayout.Button("열린 씬 저장", GUILayout.Width(100f)))
-                    Defer(() => EditorSceneManager.SaveOpenScenes());
+                if (GUILayout.Button(new GUIContent("씬·에셋 저장", "열린 씬과 수정된 에셋(TMP 머티리얼 등)을 저장합니다."), GUILayout.Width(100f)))
+                {
+                    Defer(() =>
+                    {
+                        EditorSceneManager.SaveOpenScenes();
+                        AssetDatabase.SaveAssets();
+                    });
+                }
             }
             EditorGUILayout.EndHorizontal();
         }
@@ -928,7 +996,7 @@ namespace VRCWorldPreFlight
         private void ScanAnimatorStatic(List<GameObject> objects)
         {
             var reported = new HashSet<GameObject>();
-            var pathCache = new Dictionary<RuntimeAnimatorController, HashSet<string>>();
+            var pathCache = new Dictionary<RuntimeAnimatorController, Dictionary<string, AnimatedKind>>();
 
             foreach (GameObject go in objects)
             {
@@ -936,16 +1004,17 @@ namespace VRCWorldPreFlight
                 if (animator == null)
                     continue;
 
-                HashSet<string> animatedPaths = GetAnimatedTransformPaths(animator.runtimeAnimatorController, pathCache);
+                Dictionary<string, AnimatedKind> animatedPaths = GetAnimatedPaths(animator.runtimeAnimatorController, pathCache);
 
-                // (A) Animator가 붙은 오브젝트(하위 자식을 애니메이션하는 루트 포함) 자체가 Static인 경우
+                // (A) Animator 루트 본체가 Static인 경우 (하위 자식을 애니메이션하는 루트 포함)
                 if (go.isStatic && reported.Add(go))
-                    AddAnimatorStaticIssue(go, animator, true, animatedPaths.Count > 0);
+                    AddAnimatorStaticIssue(go, animator, true, GetAffectingKinds(string.Empty, animatedPaths), HasChildPaths(animatedPaths));
 
-                // (B) Animator 클립이 Transform을 움직이는 하위 자식이 Static인 경우
                 if (animatedPaths.Count == 0)
                     continue;
 
+                // (B) 클립이 직접 애니메이션하는 경로의 오브젝트(Transform·m_IsActive·머티리얼/컴포넌트 프로퍼티)와,
+                //     Transform 이동/m_IsActive 토글을 부모로부터 함께 받는 하위 오브젝트가 Static인 경우
                 foreach (Transform child in go.GetComponentsInChildren<Transform>(true))
                 {
                     GameObject childGo = child.gameObject;
@@ -953,19 +1022,24 @@ namespace VRCWorldPreFlight
                         continue;
 
                     string relativePath = AnimationUtility.CalculateTransformPath(child, go.transform);
-                    if (!IsDrivenByTransformCurves(relativePath, animatedPaths))
+                    AnimatedKind kinds = GetAffectingKinds(relativePath, animatedPaths);
+                    if (kinds == AnimatedKind.None)
                         continue;
 
                     reported.Add(childGo);
-                    AddAnimatorStaticIssue(childGo, animator, false, false);
+                    AddAnimatorStaticIssue(childGo, animator, false, kinds, false);
                 }
             }
         }
 
-        private void AddAnimatorStaticIssue(GameObject go, Animator animator, bool isAnimatorRoot, bool animatesChildren)
+        private void AddAnimatorStaticIssue(GameObject go, Animator animator, bool isAnimatorRoot, AnimatedKind kinds, bool animatesChildren)
         {
             StaticEditorFlags flags = GameObjectUtility.GetStaticEditorFlags(go);
             bool batchingStatic = (flags & StaticEditorFlags.BatchingStatic) != 0;
+            bool occluderStatic = (flags & StaticEditorFlags.OccluderStatic) != 0;
+            bool contributeGI = (flags & StaticEditorFlags.ContributeGI) != 0;
+            bool moves = (kinds & AnimatedKind.Transform) != 0;
+            bool toggles = (kinds & AnimatedKind.Active) != 0;
 
             var description = new StringBuilder();
             if (isAnimatorRoot)
@@ -976,14 +1050,34 @@ namespace VRCWorldPreFlight
             }
             else
             {
-                description.Append($"Animator '{animator.name}'가 움직이는 하위 오브젝트가 Static으로 지정됨");
+                description.Append($"Animator '{animator.name}'의 애니메이션 대상 오브젝트가 Static으로 지정됨");
             }
+            if (kinds != AnimatedKind.None)
+                description.Append($" — 애니메이션: {DescribeAnimatedKinds(kinds)}");
 
-            description.Append(batchingStatic
-                ? "\nBatching Static: 빌드 시 메시가 병합·고정되어 이동/회전/스케일 애니메이션이 반영되지 않습니다."
-                : "\n라이트맵·오클루전이 고정 위치 기준으로 계산되어 애니메이션 시 조명·컬링 오류가 생길 수 있습니다.");
+            bool isError = false;
+            bool hasSpecificReason = false;
+            if (batchingStatic && (moves || isAnimatorRoot))
+            {
+                description.Append("\n• Batching Static: 빌드 시 메시가 병합·고정되어 이동/회전/스케일 애니메이션이 반영되지 않습니다.");
+                isError = true;
+                hasSpecificReason = true;
+            }
+            if (occluderStatic && toggles)
+            {
+                description.Append("\n• Occluder Static: 오브젝트를 꺼도 구워진 오클루전 데이터가 남아 뒤쪽 오브젝트가 사라져 보일 수 있습니다.");
+                isError = true;
+                hasSpecificReason = true;
+            }
+            if (contributeGI && (moves || toggles))
+            {
+                description.Append("\n• Contribute GI: 움직이거나 꺼져도 라이트맵에 구워진 그림자·반사광이 그대로 남습니다.");
+                hasSpecificReason = true;
+            }
+            if (!hasSpecificReason)
+                description.Append("\n• 라이트맵·오클루전·배칭이 고정 상태 기준으로 계산되어 애니메이션 결과와 어긋날 수 있습니다.");
 
-            Issue issue = AddIssue(Category.AnimatorStatic, batchingStatic ? Severity.Error : Severity.Warning, go, description.ToString());
+            Issue issue = AddIssue(Category.AnimatorStatic, isError ? Severity.Error : Severity.Warning, go, description.ToString());
             issue.SetFix("Static 해제", () =>
             {
                 if (go == null)
@@ -995,48 +1089,98 @@ namespace VRCWorldPreFlight
             });
         }
 
-        /// <summary>컨트롤러의 모든 클립에서 Transform 커브가 걸린 경로(Animator 기준 상대 경로)를 수집</summary>
-        private static HashSet<string> GetAnimatedTransformPaths(RuntimeAnimatorController controller,
-            Dictionary<RuntimeAnimatorController, HashSet<string>> cache)
+        /// <summary>
+        /// 컨트롤러의 모든 클립에서 애니메이션 대상 경로(Animator 기준 상대 경로)와 바인딩 종류를 수집합니다.
+        /// float 커브(Transform·m_IsActive·머티리얼/컴포넌트 수치)와 오브젝트 참조 커브(머티리얼·스프라이트 교체)를 모두 분석합니다.
+        /// </summary>
+        private static Dictionary<string, AnimatedKind> GetAnimatedPaths(RuntimeAnimatorController controller,
+            Dictionary<RuntimeAnimatorController, Dictionary<string, AnimatedKind>> cache)
         {
             if (controller == null)
-                return s_EmptyPaths;
-            if (cache.TryGetValue(controller, out HashSet<string> cached))
+                return s_NoAnimatedPaths;
+            if (cache.TryGetValue(controller, out Dictionary<string, AnimatedKind> cached))
                 return cached;
 
-            var paths = new HashSet<string>();
+            var paths = new Dictionary<string, AnimatedKind>();
             var visitedClips = new HashSet<AnimationClip>();
             foreach (AnimationClip clip in controller.animationClips)
             {
                 if (clip == null || !visitedClips.Add(clip))
                     continue;
+
+                // Humanoid 클립은 Animator 타입의 머슬 커브로 본(Transform) 계층 전체를 움직임
+                if (clip.humanMotion)
+                    AddAnimatedKind(paths, string.Empty, AnimatedKind.Transform);
+
                 foreach (EditorCurveBinding binding in AnimationUtility.GetCurveBindings(clip))
-                {
-                    if (binding.type == typeof(Transform))
-                        paths.Add(binding.path);
-                }
+                    AddAnimatedKind(paths, binding.path, ClassifyBinding(binding));
+                foreach (EditorCurveBinding binding in AnimationUtility.GetObjectReferenceCurveBindings(clip))
+                    AddAnimatedKind(paths, binding.path, ClassifyBinding(binding));
             }
 
             cache[controller] = paths;
             return paths;
         }
 
-        /// <summary>자신 또는 상위 경로가 Transform 애니메이션 대상이면 함께 움직임</summary>
-        private static bool IsDrivenByTransformCurves(string relativePath, HashSet<string> animatedPaths)
+        private static AnimatedKind ClassifyBinding(EditorCurveBinding binding)
         {
-            if (animatedPaths.Contains(relativePath))
-                return true;
+            if (binding.type != null && typeof(Transform).IsAssignableFrom(binding.type))
+                return AnimatedKind.Transform;
+            if (binding.type == typeof(GameObject))
+                return AnimatedKind.Active; // GameObject에서 애니메이션 가능한 속성은 m_IsActive뿐
+            return AnimatedKind.Property;
+        }
 
-            foreach (string path in animatedPaths)
+        private static void AddAnimatedKind(Dictionary<string, AnimatedKind> paths, string path, AnimatedKind kind)
+        {
+            paths.TryGetValue(path, out AnimatedKind existing);
+            paths[path] = existing | kind;
+        }
+
+        /// <summary>
+        /// 경로 자신에 걸린 모든 바인딩 + 상위 경로의 Transform 이동/m_IsActive 토글(하위로 전파됨)을 합산.
+        /// 머티리얼·컴포넌트 프로퍼티는 해당 오브젝트에만 영향을 주므로 전파하지 않음.
+        /// </summary>
+        private static AnimatedKind GetAffectingKinds(string relativePath, Dictionary<string, AnimatedKind> animatedPaths)
+        {
+            animatedPaths.TryGetValue(relativePath, out AnimatedKind kinds);
+            foreach (KeyValuePair<string, AnimatedKind> pair in animatedPaths)
             {
-                if (path.Length == 0)
-                    return true; // Animator 루트 자체가 움직이면 모든 자식이 함께 움직임
-                if (relativePath.Length > path.Length
-                    && relativePath[path.Length] == '/'
-                    && relativePath.StartsWith(path, StringComparison.Ordinal))
+                if (IsAncestorPath(pair.Key, relativePath))
+                    kinds |= pair.Value & InheritedAnimatedKinds;
+            }
+            return kinds;
+        }
+
+        private static bool IsAncestorPath(string ancestor, string path)
+        {
+            if (ancestor.Length == 0)
+                return path.Length > 0; // 빈 경로 = Animator 루트
+            return path.Length > ancestor.Length
+                && path[ancestor.Length] == '/'
+                && path.StartsWith(ancestor, StringComparison.Ordinal);
+        }
+
+        private static bool HasChildPaths(Dictionary<string, AnimatedKind> animatedPaths)
+        {
+            foreach (string path in animatedPaths.Keys)
+            {
+                if (path.Length > 0)
                     return true;
             }
             return false;
+        }
+
+        private static string DescribeAnimatedKinds(AnimatedKind kinds)
+        {
+            var parts = new List<string>(3);
+            if ((kinds & AnimatedKind.Transform) != 0)
+                parts.Add("Transform 이동");
+            if ((kinds & AnimatedKind.Active) != 0)
+                parts.Add("활성화(m_IsActive) 토글");
+            if ((kinds & AnimatedKind.Property) != 0)
+                parts.Add("머티리얼/컴포넌트 프로퍼티");
+            return string.Join(", ", parts);
         }
 
         // ---------------------------------------------------------------- 3. MeshCollider & Negative Scale / Bounds
@@ -1250,6 +1394,7 @@ namespace VRCWorldPreFlight
         {
             TMP_FontAsset font = tmp.font;
             Material material = tmp.fontSharedMaterial;
+            Texture2D atlas = font != null ? GetFontAtlas(font) : null;
 
             string problem;
             if (font == null)
@@ -1273,20 +1418,29 @@ namespace VRCWorldPreFlight
                 else
                     issue.Description += "\nTMP Settings에 기본 폰트가 없어 자동 수정할 수 없습니다. (Window > TextMeshPro > Import TMP Essential Resources)";
             }
+            else if (material != null && atlas != null && material.HasProperty(MainTexProperty) && MatchesAtlasSize(material, atlas))
+            {
+                // 1순위: 현재 머티리얼(커스텀 프리셋 포함)의 _MainTex에 폰트 Atlas를 직접 재연결 → Outline/Underlay 등 셰이더 설정 보존
+                issue.SetFix("Atlas 재연결", () => RelinkFontAtlas(tmp, material),
+                    $"머티리얼 '{material.name}'의 _MainTex에 폰트 '{font.name}'의 Atlas 텍스처를 다시 연결합니다.\nOutline/Underlay 등 머티리얼 설정은 그대로 유지되며, 공유 에셋이므로 이 머티리얼을 쓰는 모든 텍스트에 적용됩니다.\n\n계속하시겠습니까?");
+            }
             else if (IsValidTmpMaterial(font.material))
             {
-                // 폰트 기본 머티리얼은 정상 → 깨진 머티리얼 대신 기본 머티리얼 사용
+                // 2순위: 현재 머티리얼에 재연결할 수 없으면(셰이더 누락·Atlas 없음·다른 폰트용 프리셋) 폰트 기본 머티리얼로 교체
+                if (material != null && atlas != null && material.HasProperty(MainTexProperty))
+                    issue.Description += $"\n머티리얼 '{material.name}'에 기록된 Atlas 크기가 폰트 '{font.name}'과 달라(다른 폰트용 프리셋) Atlas를 재연결하지 않습니다.";
                 string confirm = material != null
                     ? $"깨진 머티리얼 '{material.name}' 대신 폰트 기본 머티리얼 '{font.material.name}'을(를) 사용합니다.\n외곽선·그림자 등 머티리얼 프리셋 설정은 적용되지 않습니다.\n\n계속하시겠습니까?"
                     : null;
                 issue.SetFix("머티리얼 복구", () => RestoreTmpMaterial(tmp), confirm);
             }
-            else if (font.material != null && font.material.HasProperty(MainTexProperty) && GetFontAtlas(font) != null)
+            else if (font.material != null && font.material.HasProperty(MainTexProperty) && atlas != null)
             {
-                // 폰트 기본 머티리얼이 Atlas 참조만 잃은 경우 → Atlas 서브 에셋을 다시 연결
-                issue.Description += $"\n폰트 에셋 '{font.name}'의 기본 머티리얼이 Atlas 텍스처 참조를 잃었습니다.";
-                issue.SetFix("Atlas 재연결", () => RelinkFontAtlas(tmp),
-                    $"폰트 에셋 '{font.name}'의 기본 머티리얼 '{font.material.name}'에 Atlas 텍스처를 다시 연결합니다.\n공유 에셋이므로 이 폰트를 쓰는 모든 텍스트에 적용됩니다.\n\n계속하시겠습니까?");
+                // 3순위: 폰트 기본 머티리얼 자체가 Atlas 참조를 잃은 경우 → 기본 머티리얼에 Atlas 재연결 후 사용
+                Material fontMaterial = font.material;
+                issue.Description += $"\n폰트 에셋 '{font.name}'의 기본 머티리얼도 Atlas 텍스처 참조를 잃었습니다.";
+                issue.SetFix("Atlas 재연결", () => RelinkFontAtlas(tmp, fontMaterial),
+                    $"폰트 에셋 '{font.name}'의 기본 머티리얼 '{fontMaterial.name}'에 Atlas 텍스처를 다시 연결합니다.\n공유 에셋이므로 이 폰트를 쓰는 모든 텍스트에 적용됩니다.\n\n계속하시겠습니까?");
             }
             else
             {
@@ -1299,11 +1453,28 @@ namespace VRCWorldPreFlight
             return material != null && material.HasProperty(MainTexProperty) && material.mainTexture != null;
         }
 
-        /// <summary>TMP_FontAsset.atlasTexture는 Atlas 배열이 비어 있으면 예외가 나므로 배열을 직접 확인</summary>
+        /// <summary>
+        /// font.atlasTexture를 안전하게 가져옵니다.
+        /// (atlasTexture 게터는 내부 Atlas 배열이 비어 있으면 예외를 던질 수 있으므로 배열을 먼저 확인)
+        /// </summary>
         private static Texture2D GetFontAtlas(TMP_FontAsset font)
         {
             Texture2D[] atlases = font.atlasTextures;
-            return atlases != null && atlases.Length > 0 ? atlases[0] : null;
+            if (atlases == null || atlases.Length == 0 || atlases[0] == null)
+                return null;
+            return font.atlasTexture;
+        }
+
+        /// <summary>
+        /// TMP 셰이더는 Atlas 크기를 _TextureWidth/_TextureHeight에 기록합니다.
+        /// 값이 다르면 다른 폰트용 머티리얼 프리셋으로 보고 재연결하지 않습니다 (글리프 UV 불일치로 글자가 깨지는 것을 방지).
+        /// </summary>
+        private static bool MatchesAtlasSize(Material material, Texture2D atlas)
+        {
+            if (!material.HasProperty("_TextureWidth") || !material.HasProperty("_TextureHeight"))
+                return true;
+            return Mathf.Approximately(material.GetFloat("_TextureWidth"), atlas.width)
+                && Mathf.Approximately(material.GetFloat("_TextureHeight"), atlas.height);
         }
 
         private static TMP_FontAsset GetDefaultTmpFont()
@@ -1337,25 +1508,25 @@ namespace VRCWorldPreFlight
             return IsValidTmpMaterial(tmp.fontSharedMaterial);
         }
 
-        private static bool RelinkFontAtlas(TMP_Text tmp)
+        /// <summary>대상 머티리얼의 _MainTex에 폰트 Atlas를 연결하고, TMP가 그 머티리얼을 쓰도록 보장</summary>
+        private static bool RelinkFontAtlas(TMP_Text tmp, Material targetMaterial)
         {
-            if (tmp == null || tmp.font == null)
+            if (tmp == null || tmp.font == null || targetMaterial == null)
                 return false;
 
-            Material fontMaterial = tmp.font.material;
             Texture2D atlas = GetFontAtlas(tmp.font);
-            if (fontMaterial == null || atlas == null)
+            if (atlas == null)
                 return false;
 
             // 머티리얼 에셋 수정도 Undo로 기록되므로 Ctrl+Z로 되돌릴 수 있음
-            Undo.RecordObject(fontMaterial, "TMP 폰트 Atlas 재연결");
-            fontMaterial.SetTexture(MainTexProperty, atlas);
-            EditorUtility.SetDirty(fontMaterial);
+            Undo.RecordObject(targetMaterial, "TMP 폰트 Atlas 재연결");
+            targetMaterial.SetTexture(MainTexProperty, atlas);
+            EditorUtility.SetDirty(targetMaterial);
 
-            if (tmp.fontSharedMaterial != fontMaterial)
+            if (tmp.fontSharedMaterial != targetMaterial)
             {
                 Undo.RecordObject(tmp, "TMP 폰트 Atlas 재연결");
-                tmp.fontSharedMaterial = fontMaterial;
+                tmp.fontSharedMaterial = targetMaterial;
             }
             MarkModified(tmp);
             return IsValidTmpMaterial(tmp.fontSharedMaterial);
@@ -1417,6 +1588,7 @@ namespace VRCWorldPreFlight
                 }, $"거울 오브젝트 '{go.name}'을(를) 비활성화합니다.\n플레이어가 거울을 켤 수 있는 토글(Udon) 버튼이 월드에 있는지 확인하세요.\n\n계속하시겠습니까?");
             }
 
+            // VRCMirrorReflection / VRC_MirrorReflection의 직렬화 필드는 리플렉션 대신 SerializedObject로 읽음
             var serialized = new SerializedObject(mirror);
 
             // (B) Reflect Layers = Everything
@@ -1432,7 +1604,7 @@ namespace VRCWorldPreFlight
                 {
                     int mask = (1 << playerLayer) | (1 << mirrorLayer);
                     issue.SetFix("레이어 제한",
-                        () => ModifySerializedProperty(mirror, "m_ReflectLayers", p => p.intValue = mask, "거울 Reflect Layers 제한"),
+                        () => ModifySerializedProperty(mirror, "m_ReflectLayers", p => p.intValue = mask),
                         $"거울 '{go.name}'의 Reflect Layers를 Player + MirrorReflection으로 제한합니다.\n월드 배경은 더 이상 반사되지 않습니다 (플레이어 전용 거울).\n\n계속하시겠습니까?");
                 }
                 else
@@ -1450,12 +1622,15 @@ namespace VRCWorldPreFlight
                 Issue issue = AddIssue(Category.MirrorTexture, Severity.Warning, go,
                     "Disable Pixel Lights가 꺼져 있음 — 거울 반사 렌더링에도 실시간 픽셀 라이트가 계산되어 비용이 증가합니다.");
                 issue.SetFix("픽셀라이트 끄기",
-                    () => ModifySerializedProperty(mirror, "m_DisablePixelLights", p => p.boolValue = true, "거울 Disable Pixel Lights 활성화"));
+                    () => ModifySerializedProperty(mirror, "m_DisablePixelLights", p => p.boolValue = true));
             }
         }
 
-        /// <summary>SDK 타입에 의존하지 않고 SerializedProperty로 거울 설정을 수정 (Undo 기록 포함)</summary>
-        private static bool ModifySerializedProperty(Object target, string propertyPath, Action<SerializedProperty> apply, string undoName)
+        /// <summary>
+        /// SDK 타입에 의존하지 않고 SerializedObject로 거울 설정을 수정합니다.
+        /// ApplyModifiedProperties()가 Undo 기록과 프리팹 인스턴스 오버라이드를 Unity 네이티브 방식으로 처리합니다.
+        /// </summary>
+        private static bool ModifySerializedProperty(Object target, string propertyPath, Action<SerializedProperty> apply)
         {
             if (target == null)
                 return false;
@@ -1465,10 +1640,9 @@ namespace VRCWorldPreFlight
             if (property == null)
                 return false;
 
-            Undo.RecordObject(target, undoName);
             apply(property);
-            serialized.ApplyModifiedPropertiesWithoutUndo(); // Undo는 위의 RecordObject가 담당
-            MarkModified(target);
+            serialized.ApplyModifiedProperties();
+            MarkSceneDirty(target);
             return true;
         }
 
@@ -1570,6 +1744,7 @@ namespace VRCWorldPreFlight
 
             Severity severity = maxDimension >= HugeTextureSize ? Severity.Error : Severity.Warning;
             Issue issue = AddIssue(Category.MirrorTexture, severity, texture, texture.name, path, description.ToString());
+            issue.AssetPath = path;
 
             if (isRenderTexture)
             {
@@ -1584,7 +1759,10 @@ namespace VRCWorldPreFlight
 
             int targetSize = _textureMaxSize;
             issue.SetFix($"{targetSize}로 제한", () => LimitTextureSize(path, targetSize),
-                $"'{texture.name}' ({texture.width}x{texture.height})의 Max Size를 {targetSize}로 제한하고 다시 임포트합니다.\n(PC/Android/iOS 플랫폼 오버라이드 포함)\n\n계속하시겠습니까?");
+                $"'{texture.name}' ({texture.width}x{texture.height})의 Max Size를 {targetSize}로 제한하고 다시 임포트합니다.\n(PC/Android/iOS 플랫폼 오버라이드 포함)\n\n" +
+                "이 변경은 .meta 파일을 직접 수정하므로 Ctrl+Z로 되돌릴 수 없습니다. 원본 값이 백업되며, " +
+                "[원본 크기로 복원 (Restore)] 버튼으로 되돌릴 수 있습니다.\n\n계속하시겠습니까?");
+            issue.FixTooltip = "Max Size 축소 — Undo 대상이 아니며, 원본 값이 백업되어 [원본 크기로 복원 (Restore)]으로 되돌릴 수 있습니다.";
         }
 
         #endregion
@@ -1623,9 +1801,17 @@ namespace VRCWorldPreFlight
             var message = new StringBuilder($"'{k_CategoryTitles[index]}' 카테고리의 {targets.Count}개 항목을 자동 수정합니다.");
             if (visualChanges > 0)
                 message.Append($"\n\n주의: 이 중 {visualChanges}개는 외형이나 동작이 바뀔 수 있는 수정입니다. (개별 확인 생략)");
-            if (category == Category.MirrorTexture)
-                message.Append("\n텍스처 재임포트에 시간이 걸릴 수 있습니다.");
-            message.Append("\n\n모든 변경은 하나의 Undo 단계로 기록되어 Ctrl+Z 한 번으로 되돌릴 수 있습니다.");
+            bool hasTextureFixes = targets.Exists(issue => issue.AssetPath != null);
+            if (hasTextureFixes)
+            {
+                message.Append("\n\n텍스처 Max Size 축소는 .meta 파일을 직접 수정하므로 Ctrl+Z로 되돌릴 수 없습니다. ");
+                message.Append("원본 값이 백업되며 [원본 크기로 복원 (Restore)] 버튼으로 되돌릴 수 있습니다. 재임포트에 시간이 걸릴 수 있습니다.");
+                message.Append("\n\n텍스처를 제외한 변경은 하나의 Undo 단계로 기록됩니다.");
+            }
+            else
+            {
+                message.Append("\n\n모든 변경은 하나의 Undo 단계로 기록되어 Ctrl+Z 한 번으로 되돌릴 수 있습니다.");
+            }
 
             if (!EditorUtility.DisplayDialog("일괄 자동 수정", message.ToString(), "수정 실행", "취소"))
                 return;
@@ -1673,7 +1859,7 @@ namespace VRCWorldPreFlight
         }
 
         /// <summary>
-        /// 씬 오브젝트 수정 후 공통 처리: 프리팹 인스턴스 오버라이드 기록 + 씬 Dirty 표시.
+        /// 씬 오브젝트를 직접 수정한 뒤의 공통 처리: 프리팹 인스턴스 오버라이드 기록 + 씬 Dirty 표시.
         /// (Undo 기록은 각 수정 함수에서 값을 바꾸기 직전에 수행)
         /// </summary>
         private static void MarkModified(Object modified)
@@ -1683,6 +1869,14 @@ namespace VRCWorldPreFlight
 
             if (PrefabUtility.IsPartOfPrefabInstance(modified))
                 PrefabUtility.RecordPrefabInstancePropertyModifications(modified);
+
+            MarkSceneDirty(modified);
+        }
+
+        private static void MarkSceneDirty(Object modified)
+        {
+            if (modified == null)
+                return;
 
             GameObject go = modified as GameObject;
             if (go == null)
@@ -1696,12 +1890,12 @@ namespace VRCWorldPreFlight
                 EditorSceneManager.MarkSceneDirty(go.scene);
         }
 
-        // ---------------------------------------------------------------- 텍스처 임포트 설정 수정 + Undo 지원
+        // ---------------------------------------------------------------- 텍스처 Max Size 축소 + 원본 백업/복원
 
         /// <summary>
         /// 텍스처 Max Size를 제한하고 재임포트합니다.
-        /// 임포트 설정은 씬이 아닌 에셋(.meta) 상태이므로 MarkSceneDirty 대상이 아니며,
-        /// Undo.RecordObject(importer)로 기록한 뒤 Undo/Redo 시 재임포트하여 실제 텍스처에 반영합니다.
+        /// SaveAndReimport()는 디스크의 .meta를 직접 바꾸므로 Undo로 관리하지 않습니다.
+        /// 대신 최초 원본 값을 세션 백업에 보관했다가 [원본 크기로 복원 (Restore)]으로 되돌립니다.
         /// </summary>
         private static bool LimitTextureSize(string path, int maxSize)
         {
@@ -1709,81 +1903,199 @@ namespace VRCWorldPreFlight
             if (importer == null)
                 return false;
 
-            string before = DescribeImporterSizes(importer);
-            Undo.RecordObject(importer, "텍스처 Max Size 제한");
+            LoadTextureBackups();
 
+            // 여러 번 축소해도 최초 원본 값이 남도록 이미 백업된 값은 덮어쓰지 않음
+            bool addedDefaultBackup = false;
+            if (!s_OriginalMaxTextureSizes.ContainsKey(path))
+            {
+                s_OriginalMaxTextureSizes.Add(path, importer.maxTextureSize);
+                addedDefaultBackup = true;
+            }
+
+            bool changed = false;
             if (importer.maxTextureSize > maxSize)
+            {
                 importer.maxTextureSize = maxSize;
+                changed = true;
+            }
 
             foreach (string platform in k_TexturePlatforms)
             {
                 TextureImporterPlatformSettings settings = importer.GetPlatformTextureSettings(platform);
                 if (!settings.overridden || settings.maxTextureSize <= maxSize)
                     continue;
+
+                string key = PlatformBackupKey(path, platform);
+                if (!s_OriginalPlatformMaxSizes.ContainsKey(key))
+                    s_OriginalPlatformMaxSizes.Add(key, settings.maxTextureSize);
                 settings.maxTextureSize = maxSize;
                 importer.SetPlatformTextureSettings(settings);
+                changed = true;
             }
 
-            importer.SaveAndReimport();
-            s_TrackedImporters[path] = DescribeImporterSizes(importer);
+            Object asset = AssetDatabase.LoadMainAssetAtPath(path);
+            if (!changed)
+            {
+                if (addedDefaultBackup)
+                    s_OriginalMaxTextureSizes.Remove(path);
+                Debug.LogWarning($"{LogPrefix}'{path}'의 Max Size가 이미 {maxSize} 이하입니다. 다른 플랫폼 설정이나 텍스처 형식을 확인하세요.", asset);
+                return false;
+            }
 
-            Debug.Log($"{LogPrefix}'{path}' Max Size를 {maxSize}로 제한했습니다. (이전 설정 — {before})",
-                AssetDatabase.LoadMainAssetAtPath(path));
+            SaveTextureBackups();
+            importer.SaveAndReimport();
+            Debug.Log($"{LogPrefix}'{path}' Max Size를 {maxSize}로 제한했습니다. (원본: {DescribeTextureBackup(path)}) — [원본 크기로 복원 (Restore)]으로 되돌릴 수 있습니다.", asset);
             return true;
         }
 
-        /// <summary>기본/플랫폼별 Max Size를 문자열로 요약 (Undo 감지용 서명 겸 로그 출력용)</summary>
-        private static string DescribeImporterSizes(TextureImporter importer)
+        /// <summary>백업해 둔 원본 Max Size(기본 + 플랫폼 오버라이드)로 되돌리고 재임포트</summary>
+        private static bool RestoreTextureSize(string path)
         {
-            var builder = new StringBuilder();
-            builder.Append("Default ").Append(importer.maxTextureSize);
+            LoadTextureBackups();
+            if (!s_OriginalMaxTextureSizes.TryGetValue(path, out int originalSize))
+                return false;
+
+            var importer = AssetImporter.GetAtPath(path) as TextureImporter;
+            if (importer == null)
+            {
+                Debug.LogWarning($"{LogPrefix}'{path}' 텍스처를 찾을 수 없어(이동 또는 삭제됨) 백업을 삭제합니다.");
+                RemoveTextureBackup(path);
+                return false;
+            }
+
+            importer.maxTextureSize = originalSize;
             foreach (string platform in k_TexturePlatforms)
             {
+                if (!s_OriginalPlatformMaxSizes.TryGetValue(PlatformBackupKey(path, platform), out int platformSize))
+                    continue;
                 TextureImporterPlatformSettings settings = importer.GetPlatformTextureSettings(platform);
-                builder.Append(", ").Append(platform).Append(' ');
-                builder.Append(settings.overridden ? settings.maxTextureSize.ToString() : "-");
+                settings.maxTextureSize = platformSize;
+                importer.SetPlatformTextureSettings(settings);
+            }
+
+            string restored = DescribeTextureBackup(path);
+            RemoveTextureBackup(path);
+            importer.SaveAndReimport();
+            Debug.Log($"{LogPrefix}'{path}' Max Size를 원본({restored})으로 복원했습니다.", AssetDatabase.LoadMainAssetAtPath(path));
+            return true;
+        }
+
+        private void RestoreTexture(string path)
+        {
+            if (EditorApplication.isPlayingOrWillChangePlaymode)
+                return;
+            if (!EditorUtility.DisplayDialog("원본 크기로 복원",
+                    $"'{path}'의 Max Size를 원본 값({DescribeTextureBackup(path)})으로 되돌리고 다시 임포트합니다.\n\n계속하시겠습니까?",
+                    "복원", "취소"))
+                return;
+
+            if (RestoreTextureSize(path))
+                ReopenTextureIssues(path);
+        }
+
+        private void RestoreAllTextures()
+        {
+            if (EditorApplication.isPlayingOrWillChangePlaymode)
+                return;
+
+            LoadTextureBackups();
+            var paths = new List<string>(s_OriginalMaxTextureSizes.Keys);
+            if (paths.Count == 0)
+                return;
+            if (!EditorUtility.DisplayDialog("원본 크기로 복원",
+                    $"백업된 텍스처 {paths.Count}개의 Max Size를 모두 원본 값으로 되돌리고 다시 임포트합니다.\n\n계속하시겠습니까?",
+                    "모두 복원", "취소"))
+                return;
+
+            AssetDatabase.StartAssetEditing(); // 재임포트를 모아서 한 번에 처리
+            try
+            {
+                for (int i = 0; i < paths.Count; i++)
+                {
+                    EditorUtility.DisplayProgressBar("원본 크기로 복원", paths[i], (float)i / paths.Count);
+                    if (RestoreTextureSize(paths[i]))
+                        ReopenTextureIssues(paths[i]);
+                }
+            }
+            finally
+            {
+                AssetDatabase.StopAssetEditing();
+                EditorUtility.ClearProgressBar();
+            }
+        }
+
+        /// <summary>복원된 텍스처의 스캔 결과를 다시 미해결 상태로 되돌려 Fix를 재사용할 수 있게 함</summary>
+        private void ReopenTextureIssues(string path)
+        {
+            foreach (Issue issue in _issues[(int)Category.MirrorTexture])
+            {
+                if (issue.AssetPath == path)
+                    issue.IsFixed = false;
+            }
+        }
+
+        private static string PlatformBackupKey(string path, string platform)
+        {
+            return path + "|" + platform;
+        }
+
+        /// <summary>백업된 원본 값을 "Default 4096, Android 4096" 형태로 요약</summary>
+        private static string DescribeTextureBackup(string path)
+        {
+            var builder = new StringBuilder();
+            if (s_OriginalMaxTextureSizes.TryGetValue(path, out int originalSize))
+                builder.Append("Default ").Append(originalSize);
+            foreach (string platform in k_TexturePlatforms)
+            {
+                if (s_OriginalPlatformMaxSizes.TryGetValue(PlatformBackupKey(path, platform), out int platformSize))
+                    builder.Append(", ").Append(platform).Append(' ').Append(platformSize);
             }
             return builder.ToString();
         }
 
-        [InitializeOnLoadMethod]
-        private static void RegisterImporterUndoHook()
+        private static void RemoveTextureBackup(string path)
         {
-            Undo.undoRedoPerformed -= OnUndoRedoForImporters;
-            Undo.undoRedoPerformed += OnUndoRedoForImporters;
+            s_OriginalMaxTextureSizes.Remove(path);
+            foreach (string platform in k_TexturePlatforms)
+                s_OriginalPlatformMaxSizes.Remove(PlatformBackupKey(path, platform));
+            SaveTextureBackups();
         }
 
-        private static void OnUndoRedoForImporters()
+        // 스크립트 리컴파일(도메인 리로드)에도 백업이 사라지지 않도록 SessionState에 보관 — 에디터를 닫으면 삭제됨
+        private static void LoadTextureBackups()
         {
-            if (s_TrackedImporters.Count == 0 || s_ImporterRevertScheduled)
+            if (s_TextureBackupsLoaded)
                 return;
-            // Undo 처리 도중 재임포트하지 않도록 다음 에디터 업데이트로 미룸
-            s_ImporterRevertScheduled = true;
-            EditorApplication.delayCall += ReimportRevertedTextures;
+            s_TextureBackupsLoaded = true;
+            DeserializeBackup(SessionState.GetString(DefaultSizeBackupKey, string.Empty), s_OriginalMaxTextureSizes);
+            DeserializeBackup(SessionState.GetString(PlatformSizeBackupKey, string.Empty), s_OriginalPlatformMaxSizes);
         }
 
-        /// <summary>Undo/Redo로 Importer 값이 바뀐 텍스처만 다시 임포트</summary>
-        private static void ReimportRevertedTextures()
+        private static void SaveTextureBackups()
         {
-            s_ImporterRevertScheduled = false;
+            SessionState.SetString(DefaultSizeBackupKey, SerializeBackup(s_OriginalMaxTextureSizes));
+            SessionState.SetString(PlatformSizeBackupKey, SerializeBackup(s_OriginalPlatformMaxSizes));
+        }
 
-            foreach (string path in new List<string>(s_TrackedImporters.Keys))
+        private static string SerializeBackup(Dictionary<string, int> backup)
+        {
+            var builder = new StringBuilder();
+            foreach (KeyValuePair<string, int> pair in backup)
+                builder.Append(pair.Key).Append('\t').Append(pair.Value).Append('\n');
+            return builder.ToString();
+        }
+
+        private static void DeserializeBackup(string data, Dictionary<string, int> backup)
+        {
+            backup.Clear();
+            foreach (string line in data.Split('\n'))
             {
-                var importer = AssetImporter.GetAtPath(path) as TextureImporter;
-                if (importer == null)
-                {
-                    s_TrackedImporters.Remove(path);
+                int tab = line.LastIndexOf('\t');
+                if (tab <= 0)
                     continue;
-                }
-
-                string current = DescribeImporterSizes(importer);
-                if (current == s_TrackedImporters[path])
-                    continue;
-
-                s_TrackedImporters[path] = current;
-                EditorUtility.SetDirty(importer);
-                importer.SaveAndReimport();
-                Debug.Log($"{LogPrefix}Undo/Redo로 '{path}' 임포트 설정을 되돌려 다시 임포트했습니다. ({current})");
+                if (int.TryParse(line.Substring(tab + 1), out int size))
+                    backup[line.Substring(0, tab)] = size;
             }
         }
 
