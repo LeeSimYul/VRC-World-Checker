@@ -5,8 +5,10 @@
 //  대상 환경 : Unity 2022.3 LTS + VRChat SDK3 Worlds (외부 패키지 의존성 없음)
 //  메뉴      : Tools > VRC World Pre-Flight Checker
 //
-//  VRChat 월드 업로드 전에 열려 있는 모든 씬을 5개 카테고리로 진단하고,
+//  VRChat 월드 업로드 전에 열려 있는 모든 씬을 6개 카테고리로 진단하고,
 //  가능한 항목은 버튼 하나로 자동 수정(Auto-Fix)합니다.
+//  씬 전체 직렬화 필드를 훑는 참조 무결성 검사, 애니메이션 바인딩 기반 Static 분석,
+//  중복 지오메트리 탐지, 스캔 간 월드 지표 비교와 Markdown 리포트를 제공합니다.
 //  씬 수정은 Undo 그룹으로 기록되므로 Ctrl+Z로 되돌릴 수 있습니다.
 //  텍스처 임포트 설정(.meta) 축소는 Undo 대신 원본 값을 백업해 [원본 크기로 복원]으로 되돌립니다.
 // ============================================================================
@@ -48,9 +50,10 @@ namespace VRCWorldPreFlight
             MeshColliderScale = 2,
             UIText = 3,
             MirrorTexture = 4,
+            References = 5,
         }
 
-        private const int CategoryCount = 5;
+        private const int CategoryCount = 6;
 
         /// <summary>스캔으로 발견된 문제 한 건</summary>
         private sealed class Issue
@@ -65,6 +68,8 @@ namespace VRCWorldPreFlight
             public Func<bool> FixAction; // 자동 수정 로직 (null이면 수동 처리 필요)
             public string FixTooltip = DefaultFixTooltip;
             public string AssetPath;     // 텍스처 항목의 에셋 경로 (원본 크기 복원 시 결과 갱신용)
+            public long SavedBytes;      // 수정 시 예상되는 메모리 절감량 (대시보드 "수정 효과" 집계용)
+            public int SavedDrawCalls;   // 수정 시 예상되는 드로우콜 절감량
             public bool IsFixed;
 
             // UnityEngine.Object의 == 연산자를 사용하므로 파괴된 오브젝트도 false로 판정됨
@@ -92,8 +97,20 @@ namespace VRCWorldPreFlight
 
         private const AnimatedKind InheritedAnimatedKinds = AnimatedKind.Transform | AnimatedKind.Active;
 
-        /// <summary>텍스처 사용처 집계</summary>
-        private sealed class TextureUsage
+        /// <summary>스캔 시점의 월드 지표 (이전 스캔과 비교해 개선 효과를 수치로 보여줌)</summary>
+        private sealed class WorldMetrics
+        {
+            public string SceneKey;      // 같은 씬 구성끼리만 비교하기 위한 키
+            public int Errors;
+            public int Warnings;
+            public long Triangles;       // 활성 렌더러 기준
+            public int UniqueMaterials;  // 렌더러 + Skybox에서 쓰는 고유 머티리얼
+            public long TextureBytes;    // 씬에서 사용하는 텍스처 메모리 합계 (에디터 기준 추정치)
+            public int RealtimeLights;   // 실시간/혼합 라이트
+        }
+
+        /// <summary>에셋(텍스처·머티리얼) 사용처 집계</summary>
+        private sealed class AssetUsage
         {
             public int Count;
             public string FirstUser;
@@ -112,20 +129,22 @@ namespace VRCWorldPreFlight
             "3. MeshCollider & Negative Scale",
             "4. Legacy UI Text & 깨진 TMP",
             "5. 거울(Mirror) & 고해상도 텍스처",
+            "6. 참조 무결성 (Missing Reference)",
         };
 
         private static readonly string[] k_CategoryHelp =
         {
             "열린 씬의 모든 GameObject(비활성 포함)에서 누락된 스크립트를 찾습니다. VRChat 업로드 실패와 Udon 오류의 가장 흔한 원인입니다.",
             "Animator가 있거나 Animator가 움직이는 오브젝트가 Static이면 정적 배칭·라이트맵 처리 때문에 애니메이션이 고정되거나 조명이 어긋납니다.",
-            "음수 스케일(노멀·콜라이더 반전), 피벗과 Bounds 중심의 비정상적인 불일치, 메시가 없거나 지나치게 무거운 MeshCollider를 찾습니다.",
+            "음수 스케일(노멀·콜라이더 반전), 피벗과 Bounds 중심의 비정상적인 불일치, 메시가 없거나 지나치게 무거운 MeshCollider, 완전히 겹친 중복 메시(Z-fighting·드로우콜 낭비)를 찾습니다.",
             "Legacy UI Text(Dynamic Font 텍스처 4096 초과 위험)와 Atlas 텍스처가 없는 TMP(검은 사각형 버그)를 찾습니다.",
             "기본 활성화된 거울과 과도한 반사 설정, 허용 크기를 넘는 고해상도 텍스처(씬에서 실제로 사용 중인 것만)를 찾습니다.",
+            "모든 컴포넌트의 직렬화 필드를 훑어 Missing 참조(Udon 공개 변수·UI 이벤트 포함), 원본이 사라진 프리팹, 프로그램이 없는 UdonBehaviour, 빈 머티리얼 슬롯과 셰이더를 찾을 수 없는(분홍색) 머티리얼을 찾습니다.",
         };
 
         private static readonly string[] k_BulkFixLabels =
         {
-            "일괄 제거", "일괄 Static 해제", "일괄 수정", "일괄 수정", "일괄 수정",
+            "일괄 제거", "일괄 Static 해제", "일괄 수정", "일괄 수정", "일괄 수정", "일괄 수정",
         };
 
         // 텍스처 크기 제한 시 함께 낮출 플랫폼 오버라이드 (PC / Quest(Android) / iOS)
@@ -144,6 +163,22 @@ namespace VRCWorldPreFlight
             "VRC_MirrorReflection", "VRCMirrorReflection", "MirrorReflection",
         };
 
+        // 참조 무결성 검사에서 제외할 내부 직렬화 필드 (자기 자신·프리팹 연결 정보)
+        private static readonly HashSet<string> k_IgnoredReferenceProperties = new HashSet<string>
+        {
+            "m_GameObject", "m_Script", "m_CorrespondingSourceObject", "m_PrefabInstance", "m_PrefabAsset",
+            "m_PrefabInternal", "m_PrefabParentObject", "m_Father",
+        };
+
+        // 오브젝트 참조가 들어 있을 수 없는 원시 타입 배열 (버텍스·바이트 등 대용량 배열 순회를 건너뜀)
+        private static readonly HashSet<string> k_PrimitiveArrayElementTypes = new HashSet<string>
+        {
+            "int", "float", "double", "bool", "char", "string", "UInt8", "SInt8", "UInt16", "SInt16", "UInt32", "SInt32",
+            "UInt64", "SInt64", "Vector2", "Vector3", "Vector4", "Vector2f", "Vector3f", "Vector4f", "Quaternion",
+            "Quaternionf", "Color", "ColorRGBA", "Matrix4x4", "Matrix4x4f",
+        };
+
+        private const string ErrorShaderName = "Hidden/InternalErrorShader";
         private const string MainTexProperty = "_MainTex";
         private const string PrefsPrefix = "VRCWorldPreFlight.";
         private const string DefaultSizeBackupKey = PrefsPrefix + "TextureSizeBackup.Default";
@@ -175,9 +210,13 @@ namespace VRCWorldPreFlight
         private int _scannedObjectCount;
         private double _lastScanSeconds;
         private string _lastScanTime;
+        private WorldMetrics _metrics;
+        private WorldMetrics _previousMetrics;
+        // 다른 GameObject가 참조 중인 씬 오브젝트 (중복 지오메트리 자동 삭제 시 참조가 끊기지 않도록 사용)
+        private readonly HashSet<GameObject> _externallyReferencedObjects = new HashSet<GameObject>();
 
         // UI 상태 (창을 다시 열거나 리컴파일해도 유지)
-        [SerializeField] private bool[] _foldouts = { true, true, true, true, true };
+        [SerializeField] private bool[] _foldouts = { true, true, true, true, true, true };
         [SerializeField] private bool _settingsFoldout;
         [SerializeField] private bool _showErrors = true;
         [SerializeField] private bool _showWarnings = true;
@@ -199,6 +238,7 @@ namespace VRCWorldPreFlight
         private static readonly Dictionary<Type, bool> s_MirrorTypeCache = new Dictionary<Type, bool>();
         private static readonly Dictionary<string, AnimatedKind> s_NoAnimatedPaths = new Dictionary<string, AnimatedKind>();
         private static readonly List<Texture> s_NoTextures = new List<Texture>();
+        private static readonly List<Component> s_ComponentBuffer = new List<Component>();
 
         // GUI 스타일 (EditorStyles는 OnGUI 안에서만 안전하므로 지연 생성)
         private GUIStyle _titleStyle;
@@ -267,7 +307,7 @@ namespace VRCWorldPreFlight
             }
 
             if (_foldouts == null || _foldouts.Length != CategoryCount)
-                _foldouts = new[] { true, true, true, true, true };
+                _foldouts = new[] { true, true, true, true, true, true };
         }
 
         private void ResetDisplayLimits()
@@ -488,6 +528,7 @@ namespace VRCWorldPreFlight
             GUILayout.Label(
                 $"마지막 스캔 {_lastScanTime}  ·  씬 {_scannedSceneCount}개  ·  오브젝트 {_scannedObjectCount:N0}개  ·  {_lastScanSeconds:F2}초",
                 EditorStyles.centeredGreyMiniLabel);
+            DrawWorldMetrics();
 
             if (errors == 0 && warnings == 0)
                 EditorGUILayout.HelpBox("모든 검사를 통과했습니다. 업로드 준비가 완료되었습니다!", MessageType.Info);
@@ -495,6 +536,61 @@ namespace VRCWorldPreFlight
                 EditorGUILayout.HelpBox($"업로드 전에 반드시 해결해야 할 오류가 {errors}개 있습니다. (경고 {warnings}개)", MessageType.Error);
             else
                 EditorGUILayout.HelpBox($"오류는 없지만 최적화 경고가 {warnings}개 있습니다.", MessageType.Warning);
+
+            EditorGUILayout.BeginHorizontal();
+            GUILayout.FlexibleSpace();
+            if (GUILayout.Button(new GUIContent("리포트 복사", "스캔 결과와 월드 지표를 Markdown으로 클립보드에 복사합니다. (이슈·PR·팀 공유용)"),
+                    EditorStyles.miniButtonLeft, GUILayout.Width(90f)))
+                CopyReport();
+            if (GUILayout.Button(new GUIContent("리포트 저장 (.md)", "스캔 결과와 월드 지표를 Markdown 파일로 저장합니다."),
+                    EditorStyles.miniButtonRight, GUILayout.Width(110f)))
+                Defer(SaveReport);
+            EditorGUILayout.EndHorizontal();
+        }
+
+        /// <summary>월드 지표 + 이전 스캔 대비 변화 + 이번 자동 수정의 예상 절감 효과</summary>
+        private void DrawWorldMetrics()
+        {
+            if (_metrics == null)
+                return;
+
+            GUILayout.Label(
+                $"월드 지표  ·  삼각형 {_metrics.Triangles:N0}  ·  머티리얼 {_metrics.UniqueMaterials}종  ·  텍스처 메모리 약 {ToMegabytes(_metrics.TextureBytes):F1} MB  ·  실시간/혼합 라이트 {_metrics.RealtimeLights}개",
+                _helpStyle);
+
+            if (_previousMetrics != null)
+                GUILayout.Label("이전 스캔 대비  ·  " + DescribeMetricChanges(_previousMetrics, _metrics), _helpStyle);
+
+            long savedBytes = 0;
+            int savedDrawCalls = 0;
+            foreach (List<Issue> list in _issues)
+            {
+                foreach (Issue issue in list)
+                {
+                    if (!issue.IsFixed)
+                        continue;
+                    savedBytes += issue.SavedBytes;
+                    savedDrawCalls += issue.SavedDrawCalls;
+                }
+            }
+            if (savedBytes > 0 || savedDrawCalls > 0)
+            {
+                GUILayout.Label(
+                    $"자동 수정 효과(예상)  ·  텍스처 메모리 약 -{ToMegabytes(savedBytes):F1} MB  ·  드로우콜 -{savedDrawCalls}  (다시 스캔하면 실제 지표로 갱신)",
+                    _helpStyle);
+            }
+        }
+
+        private static string DescribeMetricChanges(WorldMetrics before, WorldMetrics after)
+        {
+            return $"오류 {before.Errors} → {after.Errors}  ·  경고 {before.Warnings} → {after.Warnings}  ·  " +
+                   $"텍스처 메모리 {ToMegabytes(before.TextureBytes):F1} → {ToMegabytes(after.TextureBytes):F1} MB  ·  " +
+                   $"삼각형 {before.Triangles:N0} → {after.Triangles:N0}  ·  머티리얼 {before.UniqueMaterials} → {after.UniqueMaterials}종";
+        }
+
+        private static float ToMegabytes(long bytes)
+        {
+            return bytes / (1024f * 1024f);
         }
 
         private void DrawCountTile(string label, string value, GUIStyle numberStyle)
@@ -716,7 +812,7 @@ namespace VRCWorldPreFlight
             using (new EditorGUI.DisabledScope(issue.IsFixed || !alive))
             {
                 GUILayout.Label(new GUIContent(issue.ObjectName, issue.Tooltip), _nameStyle, GUILayout.Width(170f));
-                string description = alive ? issue.Description : "(오브젝트가 삭제되었거나 다시 로드되었습니다 — 다시 스캔하세요)";
+                string description = alive || issue.IsFixed ? issue.Description : "(오브젝트가 삭제되었거나 다시 로드되었습니다 — 다시 스캔하세요)";
                 GUILayout.Label(description, _wrapStyle, GUILayout.MinWidth(120f), GUILayout.ExpandWidth(true));
             }
 
@@ -836,6 +932,12 @@ namespace VRCWorldPreFlight
             foreach (List<Issue> list in _issues)
                 list.Clear();
             ResetDisplayLimits();
+            _externallyReferencedObjects.Clear();
+            if (_metrics != null)
+                _previousMetrics = _metrics;
+            _metrics = new WorldMetrics { SceneKey = string.Join(";", GetLoadedSceneNames()) };
+            if (_previousMetrics != null && _previousMetrics.SceneKey != _metrics.SceneKey)
+                _previousMetrics = null; // 다른 씬 구성과는 비교하지 않음
 
             var stopwatch = System.Diagnostics.Stopwatch.StartNew();
             try
@@ -845,21 +947,28 @@ namespace VRCWorldPreFlight
                 _scannedObjectCount = objects.Count;
                 _scannedObjects = new HashSet<GameObject>(objects);
 
-                EditorUtility.DisplayProgressBar(ProgressTitle, "1/5  Missing Scripts 검사 중...", 0.1f);
+                EditorUtility.DisplayProgressBar(ProgressTitle, "1. Missing Scripts 검사 중...", 0.05f);
                 ScanMissingScripts(objects);
 
-                EditorUtility.DisplayProgressBar(ProgressTitle, "2/5  Animator & Static 충돌 검사 중...", 0.25f);
+                EditorUtility.DisplayProgressBar(ProgressTitle, "2. Animator & Static 충돌 검사 중...", 0.1f);
                 ScanAnimatorStatic(objects);
 
-                EditorUtility.DisplayProgressBar(ProgressTitle, "3/5  MeshCollider & Negative Scale 검사 중...", 0.4f);
-                ScanMeshColliderAndScale(objects);
+                // 참조 무결성을 먼저 검사해 '다른 오브젝트가 참조 중인 오브젝트' 색인을 만든 뒤, 중복 지오메트리 삭제 안전성 판단에 사용
+                ScanReferenceIntegrity(objects, 0.15f, 0.55f);
 
-                EditorUtility.DisplayProgressBar(ProgressTitle, "4/5  Legacy UI Text & TMP 검사 중...", 0.55f);
+                EditorUtility.DisplayProgressBar(ProgressTitle, "3. MeshCollider & Negative Scale · 중복 지오메트리 검사 중...", 0.6f);
+                ScanMeshColliderAndScale(objects);
+                ScanDuplicateGeometry(objects);
+
+                EditorUtility.DisplayProgressBar(ProgressTitle, "4. Legacy UI Text & TMP 검사 중...", 0.7f);
                 ScanUIText(objects);
 
-                EditorUtility.DisplayProgressBar(ProgressTitle, "5/5  거울 & 고해상도 텍스처 검사 중...", 0.7f);
+                EditorUtility.DisplayProgressBar(ProgressTitle, "5. 거울 & 고해상도 텍스처 검사 중...", 0.8f);
                 ScanMirrors(objects);
                 ScanHighResolutionTextures(objects);
+
+                EditorUtility.DisplayProgressBar(ProgressTitle, "월드 지표 집계 중...", 0.95f);
+                CollectWorldMetrics(objects);
             }
             catch (Exception e)
             {
@@ -878,6 +987,8 @@ namespace VRCWorldPreFlight
             _isStale = false;
 
             CountIssues(out int errors, out int warnings, out _);
+            _metrics.Errors = errors;
+            _metrics.Warnings = warnings;
             Debug.Log($"{LogPrefix}스캔 완료 — 오류 {errors}개, 경고 {warnings}개 (오브젝트 {_scannedObjectCount:N0}개, {_lastScanSeconds:F2}초)");
         }
 
@@ -1650,7 +1761,7 @@ namespace VRCWorldPreFlight
 
         private void ScanHighResolutionTextures(List<GameObject> objects)
         {
-            var usages = new Dictionary<Texture, TextureUsage>();
+            var usages = new Dictionary<Texture, AssetUsage>();
             var materialCache = new Dictionary<Material, List<Texture>>();
             var renderers = new List<Renderer>();
             var graphics = new List<Graphic>();
@@ -1683,8 +1794,12 @@ namespace VRCWorldPreFlight
             foreach (Texture texture in GetMaterialTextures(RenderSettings.skybox, materialCache))
                 RegisterTextureUsage(usages, texture, "Skybox (Lighting 설정)");
 
-            foreach (KeyValuePair<Texture, TextureUsage> pair in usages)
+            _metrics.UniqueMaterials = materialCache.Count;
+            foreach (KeyValuePair<Texture, AssetUsage> pair in usages)
+            {
+                _metrics.TextureBytes += UnityEngine.Profiling.Profiler.GetRuntimeMemorySizeLong(pair.Key);
                 CheckTextureSize(pair.Key, pair.Value);
+            }
         }
 
         private static List<Texture> GetMaterialTextures(Material material, Dictionary<Material, List<Texture>> cache)
@@ -1711,19 +1826,19 @@ namespace VRCWorldPreFlight
             return textures;
         }
 
-        private static void RegisterTextureUsage(Dictionary<Texture, TextureUsage> usages, Texture texture, string user)
+        private static void RegisterTextureUsage(Dictionary<Texture, AssetUsage> usages, Texture texture, string user)
         {
             if (texture == null)
                 return;
-            if (!usages.TryGetValue(texture, out TextureUsage usage))
+            if (!usages.TryGetValue(texture, out AssetUsage usage))
             {
-                usage = new TextureUsage { FirstUser = user };
+                usage = new AssetUsage { FirstUser = user };
                 usages.Add(texture, usage);
             }
             usage.Count++;
         }
 
-        private void CheckTextureSize(Texture texture, TextureUsage usage)
+        private void CheckTextureSize(Texture texture, AssetUsage usage)
         {
             int maxDimension = Mathf.Max(texture.width, texture.height);
             if (maxDimension <= _textureMaxSize)
@@ -1737,7 +1852,8 @@ namespace VRCWorldPreFlight
             if (importer == null && !isRenderTexture)
                 return;
 
-            float megabytes = UnityEngine.Profiling.Profiler.GetRuntimeMemorySizeLong(texture) / (1024f * 1024f);
+            long bytes = UnityEngine.Profiling.Profiler.GetRuntimeMemorySizeLong(texture);
+            float megabytes = ToMegabytes(bytes);
             var description = new StringBuilder();
             description.Append($"{texture.width}x{texture.height} 고해상도 텍스처 — 허용 크기 {_textureMaxSize}px 초과 (메모리 약 {megabytes:F1} MB)");
             description.Append($"\n사용처 {usage.Count}곳 (예: {usage.FirstUser}) · VRAM·다운로드 용량이 늘어 저사양 PC/Quest 환경의 성능이 저하됩니다.");
@@ -1758,11 +1874,360 @@ namespace VRCWorldPreFlight
             }
 
             int targetSize = _textureMaxSize;
+            float ratio = (float)targetSize / maxDimension;
+            issue.SavedBytes = (long)(bytes * (1f - ratio * ratio)); // 가로·세로가 같은 비율로 줄어든다고 보고 추정
             issue.SetFix($"{targetSize}로 제한", () => LimitTextureSize(path, targetSize),
                 $"'{texture.name}' ({texture.width}x{texture.height})의 Max Size를 {targetSize}로 제한하고 다시 임포트합니다.\n(PC/Android/iOS 플랫폼 오버라이드 포함)\n\n" +
                 "이 변경은 .meta 파일을 직접 수정하므로 Ctrl+Z로 되돌릴 수 없습니다. 원본 값이 백업되며, " +
                 "[원본 크기로 복원 (Restore)] 버튼으로 되돌릴 수 있습니다.\n\n계속하시겠습니까?");
             issue.FixTooltip = "Max Size 축소 — Undo 대상이 아니며, 원본 값이 백업되어 [원본 크기로 복원 (Restore)]으로 되돌릴 수 있습니다.";
+        }
+
+        // ---------------------------------------------------------------- 3-B. 중복 지오메트리
+
+        /// <summary>메시·머티리얼·월드 행렬이 모두 같은 활성 MeshRenderer를 묶어 완전히 겹친 중복을 찾음</summary>
+        private void ScanDuplicateGeometry(List<GameObject> objects)
+        {
+            var groups = new Dictionary<string, List<MeshRenderer>>();
+            var key = new StringBuilder(256);
+
+            foreach (GameObject go in objects)
+            {
+                if (!go.activeInHierarchy)
+                    continue;
+                MeshRenderer renderer = go.GetComponent<MeshRenderer>();
+                MeshFilter filter = go.GetComponent<MeshFilter>();
+                if (renderer == null || !renderer.enabled || filter == null || filter.sharedMesh == null)
+                    continue;
+
+                // 그림자 전용 사본·거울 전용 레이어 사본처럼 의도적인 겹침은 키가 달라지도록 레이어와 그림자 모드를 포함
+                key.Clear();
+                key.Append(filter.sharedMesh.GetInstanceID());
+                key.Append('|').Append(go.layer).Append('|').Append((int)renderer.shadowCastingMode);
+                foreach (Material material in renderer.sharedMaterials)
+                    key.Append('|').Append(material != null ? material.GetInstanceID() : 0);
+
+                // 월드 행렬을 1mm 단위로 양자화해 위치·회전·스케일이 같은지 비교
+                Matrix4x4 matrix = go.transform.localToWorldMatrix;
+                for (int i = 0; i < 16; i++)
+                    key.Append('|').Append(Mathf.RoundToInt(matrix[i] * 1000f));
+
+                string groupKey = key.ToString();
+                if (!groups.TryGetValue(groupKey, out List<MeshRenderer> group))
+                {
+                    group = new List<MeshRenderer>(2);
+                    groups.Add(groupKey, group);
+                }
+                group.Add(renderer);
+            }
+
+            foreach (List<MeshRenderer> group in groups.Values)
+            {
+                if (group.Count < 2)
+                    continue;
+
+                // 다른 오브젝트가 참조 중인 쪽을 원본으로 남겨 참조가 끊기지 않게 함
+                MeshRenderer keeper = group[0];
+                foreach (MeshRenderer candidate in group)
+                {
+                    if (_externallyReferencedObjects.Contains(candidate.gameObject))
+                    {
+                        keeper = candidate;
+                        break;
+                    }
+                }
+
+                foreach (MeshRenderer duplicate in group)
+                {
+                    if (duplicate != keeper)
+                        AddDuplicateIssue(duplicate, keeper, group.Count);
+                }
+            }
+        }
+
+        private void AddDuplicateIssue(MeshRenderer duplicate, MeshRenderer keeper, int groupSize)
+        {
+            GameObject go = duplicate.gameObject;
+            GameObject keeperGo = keeper.gameObject;
+            int drawCalls = duplicate.sharedMaterials.Length;
+
+            Issue issue = AddIssue(Category.MeshColliderScale, Severity.Warning, go,
+                $"'{keeperGo.name}'과(와) 메시·머티리얼·위치·회전·스케일이 완전히 같은 중복 오브젝트 ({groupSize}개 겹침) — " +
+                $"같은 면이 두 번 그려져 Z-fighting(깜빡임)이 생기고 드로우콜 {drawCalls}개와 라이트맵 공간이 낭비됩니다.");
+            issue.SavedDrawCalls = drawCalls;
+
+            string blocker = GetDeleteBlocker(go, keeperGo);
+            if (blocker != null)
+            {
+                issue.Description += $"\n{blocker} — 자동 삭제하지 않습니다. 확인 후 직접 정리하세요.";
+                return;
+            }
+
+            issue.SetFix("중복 삭제", () =>
+            {
+                if (go == null)
+                    return false;
+                Scene scene = go.scene;
+                Undo.DestroyObjectImmediate(go);
+                if (scene.IsValid() && scene.isLoaded)
+                    EditorSceneManager.MarkSceneDirty(scene);
+                return true;
+            }, $"중복 오브젝트 '{go.name}'을(를) 삭제하고 '{keeperGo.name}'만 남깁니다.\nCtrl+Z로 되돌릴 수 있습니다.\n\n계속하시겠습니까?");
+        }
+
+        /// <summary>중복 오브젝트를 자동 삭제하면 안 되는 이유 (안전하면 null)</summary>
+        private string GetDeleteBlocker(GameObject go, GameObject keeper)
+        {
+            if (go.transform.childCount > 0)
+                return "하위 오브젝트가 있음";
+            if (_externallyReferencedObjects.Contains(go))
+                return "Udon·UI 이벤트 등 다른 컴포넌트가 이 오브젝트를 참조 중";
+            if (PrefabUtility.IsPartOfPrefabInstance(go) && !PrefabUtility.IsOutermostPrefabInstanceRoot(go))
+                return "프리팹 인스턴스 내부 오브젝트";
+            for (Transform t = go.transform; t != null; t = t.parent)
+            {
+                if (t.GetComponent<Animator>() != null)
+                    return "Animator 하위 오브젝트(애니메이션 경로가 끊길 수 있음)";
+            }
+
+            go.GetComponents(s_ComponentBuffer);
+            foreach (Component component in s_ComponentBuffer)
+            {
+                if (component == null)
+                    return "Missing Script가 있음";
+                if (!(component is Transform || component is MeshFilter || component is MeshRenderer || component is Collider))
+                    return $"추가 컴포넌트({component.GetType().Name})가 있음";
+                if (component is Collider && keeper.GetComponent(component.GetType()) == null)
+                    return $"원본에 없는 콜라이더({component.GetType().Name})가 있음 — 삭제하면 충돌 판정이 사라짐";
+            }
+            return null;
+        }
+
+        // ---------------------------------------------------------------- 6. 참조 무결성
+
+        private void ScanReferenceIntegrity(List<GameObject> objects, float progressStart, float progressEnd)
+        {
+            var components = new List<Component>();
+            var missingPrefabRoots = new HashSet<GameObject>();
+            var brokenMaterials = new Dictionary<Material, AssetUsage>();
+            var shaderChecked = new Dictionary<Material, bool>();
+            var missing = new List<string>();
+
+            for (int i = 0; i < objects.Count; i++)
+            {
+                if (i % 200 == 0)
+                {
+                    EditorUtility.DisplayProgressBar(ProgressTitle, $"6. 참조 무결성 검사 중... ({i:N0}/{objects.Count:N0})",
+                        Mathf.Lerp(progressStart, progressEnd, (float)i / objects.Count));
+                }
+
+                GameObject go = objects[i];
+
+                // (A) 원본 에셋이 삭제·이동된 프리팹 인스턴스 (Missing Prefab)
+                if (PrefabUtility.GetPrefabInstanceStatus(go) == PrefabInstanceStatus.MissingAsset)
+                {
+                    GameObject root = PrefabUtility.GetNearestPrefabInstanceRoot(go);
+                    if (root == null)
+                        root = go;
+                    if (missingPrefabRoots.Add(root))
+                    {
+                        AddIssue(Category.References, Severity.Error, root,
+                            "원본 프리팹 에셋이 삭제·이동된 Missing Prefab — 프리팹 내용이 월드에서 사라지거나 빌드 오류가 날 수 있습니다. 원본 에셋을 복구하거나, 필요 없다면 오브젝트를 삭제하세요.");
+                    }
+                }
+
+                // (B) 컴포넌트 직렬화 필드: Missing 참조 / 빈 머티리얼 슬롯 / 프로그램 없는 UdonBehaviour
+                missing.Clear();
+                int emptyMaterialSlots = 0;
+                bool emptyUdonProgram = false;
+                go.GetComponents(components);
+                foreach (Component component in components)
+                {
+                    if (component == null || component is Transform)
+                        continue;
+                    InspectSerializedReferences(component, missing, ref emptyMaterialSlots, ref emptyUdonProgram);
+
+                    // (C) 셰이더 누락·컴파일 오류 머티리얼 (분홍색 렌더링)
+                    Renderer renderer = component as Renderer;
+                    if (renderer is MeshRenderer || renderer is SkinnedMeshRenderer)
+                        CollectBrokenShaderMaterials(renderer, shaderChecked, brokenMaterials);
+                }
+
+                if (missing.Count > 0)
+                {
+                    var description = new StringBuilder();
+                    description.Append($"Missing 참조 {missing.Count}개 — 삭제·이동된 에셋이나 오브젝트를 가리키고 있어 런타임에 null이 됩니다 (Udon NullReference로 스크립트가 멈추는 주요 원인).\n");
+                    const int maxListed = 4;
+                    description.Append(string.Join(", ", missing.GetRange(0, Mathf.Min(maxListed, missing.Count))));
+                    if (missing.Count > maxListed)
+                        description.Append($" 외 {missing.Count - maxListed}개");
+                    AddIssue(Category.References, Severity.Error, go, description.ToString());
+                }
+
+                if (emptyMaterialSlots > 0 && HasRenderableMesh(go))
+                {
+                    AddIssue(Category.References, Severity.Error, go,
+                        $"머티리얼 슬롯 {emptyMaterialSlots}개가 비어 있음(None) — 해당 서브메시가 분홍색(에러 셰이더)으로 렌더링됩니다. 머티리얼을 지정하거나 슬롯 수를 메시에 맞추세요.");
+                }
+
+                if (emptyUdonProgram)
+                {
+                    AddIssue(Category.References, Severity.Error, go,
+                        "UdonBehaviour에 Program Source가 지정되지 않음 — 아무 동작도 하지 않습니다. 의도한 Udon/U# 프로그램을 지정하거나 컴포넌트를 제거하세요.");
+                }
+            }
+
+            foreach (KeyValuePair<Material, AssetUsage> pair in brokenMaterials)
+            {
+                Material material = pair.Key;
+                string shaderName = material.shader != null ? material.shader.name : "None";
+                AddIssue(Category.References, Severity.Error, material, material.name, AssetDatabase.GetAssetPath(material),
+                    $"셰이더를 찾을 수 없음('{shaderName}') — 이 머티리얼을 쓰는 렌더러 {pair.Value.Count}곳(예: {pair.Value.FirstUser})이 분홍색으로 렌더링됩니다.\n" +
+                    "셰이더 패키지(lilToon, Poiyomi 등)가 프로젝트에 설치되어 있는지 확인하세요.");
+            }
+        }
+
+        /// <summary>
+        /// 컴포넌트의 모든 직렬화 필드를 순회해 Missing 참조를 찾고,
+        /// 정상 참조는 '다른 오브젝트가 참조 중' 색인에 기록합니다.
+        /// </summary>
+        private void InspectSerializedReferences(Component component, List<string> missing, ref int emptyMaterialSlots, ref bool emptyUdonProgram)
+        {
+            bool isMeshRenderer = component is MeshRenderer || component is SkinnedMeshRenderer;
+            string typeName = component.GetType().Name;
+            GameObject owner = component.gameObject;
+
+            using (var serialized = new SerializedObject(component))
+            {
+                SerializedProperty property = serialized.GetIterator();
+                bool enterChildren = true;
+                while (property.Next(enterChildren))
+                {
+                    enterChildren = ShouldEnterChildren(property);
+                    if (property.propertyType != SerializedPropertyType.ObjectReference || k_IgnoredReferenceProperties.Contains(property.name))
+                        continue;
+
+                    Object value = property.objectReferenceValue;
+                    if (value != null)
+                    {
+                        RegisterExternalReference(owner, value);
+                        continue;
+                    }
+
+                    // 값이 null인데 Instance ID가 남아 있으면 'Missing'(삭제된 대상), 0이면 단순 'None'
+                    if (property.objectReferenceInstanceIDValue != 0)
+                        missing.Add($"{typeName}.{FormatPropertyPath(property.propertyPath)}");
+                    else if (isMeshRenderer && property.propertyPath.StartsWith("m_Materials.Array.data[", StringComparison.Ordinal))
+                        emptyMaterialSlots++;
+                }
+
+                // UdonBehaviour는 SDK 타입에 의존하지 않도록 이름과 직렬화 필드로 판별
+                if (typeName == "UdonBehaviour"
+                    && IsNoneReference(serialized.FindProperty("programSource"))
+                    && IsNoneReference(serialized.FindProperty("serializedProgramAsset")))
+                    emptyUdonProgram = true;
+            }
+        }
+
+        private static bool HasRenderableMesh(GameObject go)
+        {
+            MeshFilter meshFilter = go.GetComponent<MeshFilter>();
+            if (meshFilter != null && meshFilter.sharedMesh != null)
+                return true;
+            SkinnedMeshRenderer skinned = go.GetComponent<SkinnedMeshRenderer>();
+            return skinned != null && skinned.sharedMesh != null;
+        }
+
+        private void RegisterExternalReference(GameObject owner, Object value)
+        {
+            GameObject target = value as GameObject;
+            if (target == null)
+            {
+                Component component = value as Component;
+                if (component == null)
+                    return; // 에셋 참조(메시·머티리얼 등)는 삭제 대상 판단과 무관
+                target = component.gameObject;
+            }
+            if (target != owner)
+                _externallyReferencedObjects.Add(target);
+        }
+
+        private static bool ShouldEnterChildren(SerializedProperty property)
+        {
+            if (!property.hasChildren)
+                return false;
+            if (property.propertyType != SerializedPropertyType.Generic && property.propertyType != SerializedPropertyType.ManagedReference)
+                return false;
+            return !property.isArray || !k_PrimitiveArrayElementTypes.Contains(property.arrayElementType);
+        }
+
+        private static bool IsNoneReference(SerializedProperty property)
+        {
+            return property != null
+                && property.propertyType == SerializedPropertyType.ObjectReference
+                && property.objectReferenceValue == null
+                && property.objectReferenceInstanceIDValue == 0;
+        }
+
+        /// <summary>"m_Materials.Array.data[1]" → "m_Materials[1]" + 출처 표시</summary>
+        private static string FormatPropertyPath(string propertyPath)
+        {
+            string path = propertyPath.Replace(".Array.data[", "[");
+            if (propertyPath.Contains("publicVariablesUnityEngineObjects"))
+                return path + " (Udon 공개 변수)";
+            if (propertyPath.Contains("m_PersistentCalls"))
+                return path + " (UnityEvent 대상)";
+            return path;
+        }
+
+        private static void CollectBrokenShaderMaterials(Renderer renderer, Dictionary<Material, bool> checkedMaterials,
+            Dictionary<Material, AssetUsage> brokenMaterials)
+        {
+            foreach (Material material in renderer.sharedMaterials)
+            {
+                if (material == null)
+                    continue;
+                if (!checkedMaterials.TryGetValue(material, out bool broken))
+                {
+                    Shader shader = material.shader;
+                    // 셰이더 파일이 없거나 불러오지 못하면 Unity가 InternalErrorShader로 대체함 (플랫폼별 컴파일 경고로 인한 오탐 방지)
+                    broken = shader == null || shader.name == ErrorShaderName;
+                    checkedMaterials.Add(material, broken);
+                }
+                if (!broken)
+                    continue;
+
+                if (!brokenMaterials.TryGetValue(material, out AssetUsage usage))
+                {
+                    usage = new AssetUsage { FirstUser = renderer.gameObject.name };
+                    brokenMaterials.Add(material, usage);
+                }
+                usage.Count++;
+            }
+        }
+
+        // ---------------------------------------------------------------- 월드 지표
+
+        private void CollectWorldMetrics(List<GameObject> objects)
+        {
+            foreach (GameObject go in objects)
+            {
+                if (!go.activeInHierarchy)
+                    continue;
+
+                MeshRenderer meshRenderer = go.GetComponent<MeshRenderer>();
+                MeshFilter meshFilter = go.GetComponent<MeshFilter>();
+                if (meshRenderer != null && meshRenderer.enabled && meshFilter != null && meshFilter.sharedMesh != null)
+                    _metrics.Triangles += GetTriangleCount(meshFilter.sharedMesh);
+
+                SkinnedMeshRenderer skinned = go.GetComponent<SkinnedMeshRenderer>();
+                if (skinned != null && skinned.enabled && skinned.sharedMesh != null)
+                    _metrics.Triangles += GetTriangleCount(skinned.sharedMesh);
+
+                Light light = go.GetComponent<Light>();
+                if (light != null && light.enabled && light.lightmapBakeType != LightmapBakeType.Baked)
+                    _metrics.RealtimeLights++;
+            }
         }
 
         #endregion
@@ -2097,6 +2562,107 @@ namespace VRCWorldPreFlight
                 if (int.TryParse(line.Substring(tab + 1), out int size))
                     backup[line.Substring(0, tab)] = size;
             }
+        }
+
+        #endregion
+
+        // ====================================================================
+        #region 리포트 (Markdown)
+        // ====================================================================
+
+        private void CopyReport()
+        {
+            EditorGUIUtility.systemCopyBuffer = BuildMarkdownReport();
+            ShowNotification(new GUIContent("리포트를 클립보드에 복사했습니다."));
+        }
+
+        private void SaveReport()
+        {
+            string path = EditorUtility.SaveFilePanel("Pre-Flight 리포트 저장", string.Empty,
+                $"VRC-PreFlight-{DateTime.Now:yyyyMMdd-HHmm}.md", "md");
+            if (string.IsNullOrEmpty(path))
+                return;
+
+            System.IO.File.WriteAllText(path, BuildMarkdownReport(), new UTF8Encoding(false));
+            Debug.Log($"{LogPrefix}리포트를 저장했습니다: {path}");
+        }
+
+        /// <summary>스캔 결과·월드 지표·이전 스캔 대비 변화를 이슈/PR에 붙여 넣을 수 있는 Markdown으로 정리</summary>
+        private string BuildMarkdownReport()
+        {
+            CountIssues(out int errors, out int warnings, out int fixedCount);
+            var report = new StringBuilder();
+            report.AppendLine("# VRC World Pre-Flight Report");
+            report.AppendLine();
+            report.AppendLine($"- 생성: {DateTime.Now:yyyy-MM-dd HH:mm} (마지막 스캔 {_lastScanTime})");
+            report.AppendLine($"- 씬: {string.Join(", ", GetLoadedSceneNames())}");
+            report.AppendLine($"- 검사 오브젝트: {_scannedObjectCount:N0}개");
+            report.AppendLine($"- 결과: 오류 {errors} · 경고 {warnings} · 자동 수정 {fixedCount}");
+
+            if (_metrics != null)
+            {
+                report.AppendLine();
+                report.AppendLine("## 월드 지표");
+                report.AppendLine();
+                report.AppendLine(_previousMetrics != null ? "| 항목 | 이전 스캔 | 현재 |" : "| 항목 | 현재 |");
+                report.AppendLine(_previousMetrics != null ? "| --- | ---: | ---: |" : "| --- | ---: |");
+                AppendMetricRow(report, "오류", m => m.Errors.ToString("N0"));
+                AppendMetricRow(report, "경고", m => m.Warnings.ToString("N0"));
+                AppendMetricRow(report, "삼각형", m => m.Triangles.ToString("N0"));
+                AppendMetricRow(report, "머티리얼", m => m.UniqueMaterials.ToString("N0"));
+                AppendMetricRow(report, "텍스처 메모리 (MB, 추정)", m => ToMegabytes(m.TextureBytes).ToString("F1"));
+                AppendMetricRow(report, "실시간/혼합 라이트", m => m.RealtimeLights.ToString("N0"));
+            }
+
+            for (int i = 0; i < CategoryCount; i++)
+            {
+                List<Issue> list = _issues[i];
+                int categoryErrors = 0, categoryWarnings = 0, categoryFixed = 0;
+                CountList(list, ref categoryErrors, ref categoryWarnings, ref categoryFixed);
+
+                report.AppendLine();
+                report.AppendLine($"## {k_CategoryTitles[i]} — 오류 {categoryErrors} · 경고 {categoryWarnings} · 수정 {categoryFixed}");
+                report.AppendLine();
+                if (list.Count == 0)
+                {
+                    report.AppendLine("문제 없음");
+                    continue;
+                }
+
+                report.AppendLine("| 심각도 | 대상 | 내용 | 상태 |");
+                report.AppendLine("| --- | --- | --- | --- |");
+                foreach (Issue issue in list)
+                {
+                    string state = issue.IsFixed ? "수정됨" : issue.IsAlive ? "미해결" : "대상 없음";
+                    string target = string.IsNullOrEmpty(issue.Tooltip) ? issue.ObjectName : issue.Tooltip;
+                    report.AppendLine($"| {(issue.Severity == Severity.Error ? "오류" : "경고")} | `{EscapeTableCell(target)}` | {EscapeTableCell(issue.Description)} | {state} |");
+                }
+            }
+            return report.ToString();
+        }
+
+        private void AppendMetricRow(StringBuilder report, string label, Func<WorldMetrics, string> value)
+        {
+            report.AppendLine(_previousMetrics != null
+                ? $"| {label} | {value(_previousMetrics)} | {value(_metrics)} |"
+                : $"| {label} | {value(_metrics)} |");
+        }
+
+        private static string EscapeTableCell(string text)
+        {
+            return text.Replace("|", "\\|").Replace("\r", string.Empty).Replace("\n", "<br>");
+        }
+
+        private static List<string> GetLoadedSceneNames()
+        {
+            var names = new List<string>();
+            for (int i = 0; i < SceneManager.sceneCount; i++)
+            {
+                Scene scene = SceneManager.GetSceneAt(i);
+                if (scene.isLoaded)
+                    names.Add(string.IsNullOrEmpty(scene.name) ? "(Untitled)" : scene.name);
+            }
+            return names;
         }
 
         #endregion
